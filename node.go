@@ -343,7 +343,18 @@ func (n *node) Stop() {
 func (n *node) run() {
 	var propc chan msgWithResult
 	var readyc chan Ready
-	var advancec chan struct{}
+	// readyFence is the batch-confirmation fence for Ready consumption.
+	//
+	// A Ready batch is considered "in flight" from the moment it is emitted
+	// (acceptReady) until the application confirms it via Advance. While a
+	// batch is in flight the fence is "closed": the next Ready MUST NOT be
+	// produced, and the persistence messages (Entries, HardState, Snapshot) of
+	// the in-flight batch MUST NOT be re-published. Advance opens the fence and
+	// allows the next batch to be produced.
+	//
+	// nil means no batch is in flight (the fence is open); non-nil means a
+	// batch is in flight (the fence is closed).
+	var readyFence chan struct{}
 	var rd Ready
 
 	r := n.rn.raft
@@ -351,15 +362,10 @@ func (n *node) run() {
 	lead := None
 
 	for {
-		if advancec == nil && n.rn.HasReady() {
-			// Populate a Ready. Note that this Ready is not guaranteed to
-			// actually be handled. We will arm readyc, but there's no guarantee
-			// that we will actually send on it. It's possible that we will
-			// service another channel instead, loop around, and then populate
-			// the Ready again. We could instead force the previous Ready to be
-			// handled first, but it's generally good to emit larger Readys plus
-			// it simplifies testing (by emitting less frequently and more
-			// predictably).
+		// Only arm the Ready channel when no batch is in flight. This is the
+		// batch-confirmation fence: the previous batch must be Advance'd
+		// before the next batch (and its persistence messages) is published.
+		if readyFence == nil && n.rn.HasReady() {
 			rd = n.rn.readyWithoutAccept()
 			readyc = n.readyc
 		}
@@ -435,18 +441,26 @@ func (n *node) run() {
 		case readyc <- rd:
 			n.rn.acceptReady(rd)
 			if !n.rn.asyncStorageWrites {
-				advancec = n.advancec
+				// Arm the fence: the batch is now in flight. No further Ready
+				// may be produced (and no persistence messages re-published)
+				// until the application calls Advance.
+				readyFence = n.advancec
 			} else {
 				rd = Ready{}
 			}
 			readyc = nil
-		case <-advancec:
+		case <-readyFence:
+			// The application has confirmed the batch via Advance. Release it
+			// and open the fence for the next batch.
 			n.rn.Advance(rd)
 			rd = Ready{}
-			advancec = nil
+			readyFence = nil
 		case c := <-n.status:
 			c <- getStatus(r)
 		case <-n.stop:
+			// Unblock any goroutine waiting on the Ready channel so that a
+			// stopped node never leaves waiters blocked.
+			close(n.readyc)
 			close(n.done)
 			return
 		}
