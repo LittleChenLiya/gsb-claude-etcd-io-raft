@@ -144,6 +144,97 @@ func (c Changer) Simple(ccs ...*pb.ConfChangeSingle) (tracker.Config, tracker.Pr
 	return checkAndReturn(cfg, trk)
 }
 
+// PrecheckReport describes the projected effect of a proposed set of
+// configuration changes on the voting set. It is produced by Precheck without
+// modifying the active configuration.
+type PrecheckReport struct {
+	// OldVoters is the incoming majority config (Voters[0]) before the change.
+	OldVoters map[uint64]struct{}
+	// NewVoters is the incoming majority config (Voters[0]) after the change.
+	NewVoters map[uint64]struct{}
+	// AddedVoters contains the voters present in NewVoters but not in
+	// OldVoters. It is empty when the change adds no voters.
+	AddedVoters map[uint64]struct{}
+	// RemovedVoters contains the voters present in OldVoters but not in
+	// NewVoters. It is empty when the change removes no voters.
+	RemovedVoters map[uint64]struct{}
+	// JointRequired reports whether the change affects more than one voter and
+	// therefore cannot be carried out via Simple; EnterJoint followed by
+	// LeaveJoint is required instead.
+	JointRequired bool
+}
+
+// Precheck validates the proposed configuration changes and reports their
+// projected effect on the voting set without modifying the active
+// configuration. It returns a deterministic error (and a zero report) when:
+//   - a change carries a zero NodeId,
+//   - the same NodeId is targeted by more than one change (a duplicate
+//     member), or
+//   - the change would remove the last voter.
+//
+// A non-nil error means the proposal must not be applied; the active
+// configuration is left untouched in that case. For a valid proposal,
+// JointRequired indicates whether the change must be carried out via joint
+// consensus (EnterJoint/LeaveJoint) rather than Simple.
+func (c Changer) Precheck(ccs ...*pb.ConfChangeSingle) (PrecheckReport, error) {
+	cfg, trk, err := c.checkAndCopy()
+	if err != nil {
+		return PrecheckReport{}, err
+	}
+	if joint(cfg) {
+		return PrecheckReport{}, errors.New("can't apply simple config change in joint config")
+	}
+
+	// Reject invalid proposals deterministically before touching the
+	// configuration.
+	seen := make(map[uint64]struct{}, len(ccs))
+	for _, cc := range ccs {
+		id := cc.GetNodeId()
+		if id == 0 {
+			return PrecheckReport{}, errors.New("conf change has zero node id")
+		}
+		if _, dup := seen[id]; dup {
+			return PrecheckReport{}, fmt.Errorf("duplicate member %d in conf change", id)
+		}
+		seen[id] = struct{}{}
+	}
+
+	oldVoters := cloneVoters(incoming(c.Tracker.Voters))
+
+	if err := c.apply(&cfg, trk, ccs...); err != nil {
+		return PrecheckReport{}, err
+	}
+
+	newVoters := incoming(cfg.Voters)
+	return PrecheckReport{
+		OldVoters:     oldVoters,
+		NewVoters:     cloneVoters(newVoters),
+		AddedVoters:   diffVoters(newVoters, oldVoters),
+		RemovedVoters: diffVoters(oldVoters, newVoters),
+		JointRequired: symdiff(oldVoters, newVoters) > 1,
+	}, nil
+}
+
+// cloneVoters returns a copy of the given voter set.
+func cloneVoters(s map[uint64]struct{}) map[uint64]struct{} {
+	out := make(map[uint64]struct{}, len(s))
+	for id := range s {
+		out[id] = struct{}{}
+	}
+	return out
+}
+
+// diffVoters returns the ids present in a but not in b.
+func diffVoters(a, b map[uint64]struct{}) map[uint64]struct{} {
+	out := make(map[uint64]struct{})
+	for id := range a {
+		if _, ok := b[id]; !ok {
+			out[id] = struct{}{}
+		}
+	}
+	return out
+}
+
 // apply a change to the configuration. By convention, changes to voters are
 // always made to the incoming majority config Voters[0]. Voters[1] is either
 // empty or preserves the outgoing majority configuration while in a joint state.
