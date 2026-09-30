@@ -383,6 +383,15 @@ type raft struct {
 	// leadTransferee is id of the leader transfer target when its value is not zero.
 	// Follow the procedure defined in raft thesis 3.10.
 	leadTransferee uint64
+
+	// ballotTerm and ballots track the per-peer votes of the current
+	// (pre-)election round. ballotTerm is the term of the election being
+	// tracked (0 when no election is in progress). ballots contains one entry
+	// per current voter, initialized to BallotPending when a campaign starts.
+	// They are cleared whenever the node enters a new term, and vote responses
+	// from a different (in particular older) term never update them.
+	ballotTerm uint64
+	ballots    map[uint64]BallotOutcome
 	// Only one conf change may be pending (in the log, but not yet
 	// applied) at a time. This is enforced via pendingConfIndex, which
 	// is set to a value >= the log index of the latest pending
@@ -782,6 +791,10 @@ func (r *raft) reset(term uint64) {
 	if r.Term != term {
 		r.Term = term
 		r.Vote = None
+		// Entering a new term invalidates the ballots of any previous
+		// election round.
+		r.ballotTerm = 0
+		r.ballots = nil
 	}
 	r.lead = None
 
@@ -1040,6 +1053,10 @@ func (r *raft) campaign(t CampaignType) {
 		voteMsg = pb.MsgVote
 		term = r.Term
 	}
+	// Start a fresh ballot summary for this election round. This also clears
+	// the PreVote ballots when transitioning to the real election in the same
+	// term (after a successful PreVote).
+	r.resetBallots(term)
 	var ids []uint64
 	{
 		idMap := r.trk.Voters.IDs()
@@ -1694,6 +1711,14 @@ func stepCandidate(r *raft, m *pb.Message) error {
 		r.becomeFollower(m.GetTerm(), m.GetFrom()) // always m.Term == r.Term
 		r.handleSnapshot(m)
 	case myVoteRespType:
+		// Record the response in the queryable ballot summary. Delayed
+		// responses from an older election round are ignored and can never
+		// overwrite the current round's summary.
+		if !r.recordBallot(m.GetFrom(), m) {
+			r.logger.Infof("%x [term %d] ignored stale %s from %x [term %d] for election at term %d",
+				r.id, r.Term, m.GetType(), m.GetFrom(), m.GetTerm(), r.ballotTerm)
+			return nil
+		}
 		gr, rj, res := r.poll(m.GetFrom(), m.GetType(), !m.GetReject())
 		r.logger.Infof("%x has received %d %s votes and %d vote rejections", r.id, gr, m.GetType(), rj)
 		switch res {

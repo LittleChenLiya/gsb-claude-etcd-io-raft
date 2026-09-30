@@ -501,6 +501,17 @@ func (rn *RawNode) BasicStatus() BasicStatus {
 	return getBasicStatus(rn.raft)
 }
 
+// BallotSummary returns a point-in-time summary of the ballots of the current
+// (pre-)election round, sorted by peer ID. Peers are marked as granted,
+// rejected, or pending (no response yet). The summary stays available after
+// the candidate wins (becomes leader), and is cleared as soon as the node
+// enters a different term (it is empty while a node is a follower that has
+// never campaigned in the current term). Delayed responses from an older term
+// never affect the summary.
+func (rn *RawNode) BallotSummary() BallotSummary {
+	return rn.raft.ballotSummary()
+}
+
 // ProgressType indicates the type of replica a Progress corresponds to.
 type ProgressType byte
 
