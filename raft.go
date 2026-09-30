@@ -1797,7 +1797,8 @@ func (r *raft) handleAppendEntries(m *pb.Message) {
 		r.send(&pb.Message{To: m.From, Type: pb.MsgAppResp.Enum(), Index: new(r.raftLog.committed)})
 		return
 	}
-	if mlastIndex, ok := r.raftLog.maybeAppend(a, m.GetCommit()); ok {
+	mlastIndex, ok, _, _ := r.raftLog.maybeAppend(a, m.GetCommit())
+	if ok {
 		r.send(&pb.Message{To: m.From, Type: pb.MsgAppResp.Enum(), Index: new(mlastIndex)})
 		return
 	}

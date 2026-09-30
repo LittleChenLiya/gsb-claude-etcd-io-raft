@@ -106,6 +106,88 @@ func TestFindConflictByTerm(t *testing.T) {
 	}
 }
 
+func TestFindConflictLoc(t *testing.T) {
+	// fresh log: entries 1(term1), 2(term2), 3(term3); firstIndex=1, lastIndex=3
+	freshEnts := index(1).terms(1, 2, 3)
+	// snapshotted log: snapshot at 5(term5), entries 6(term6), 7(term7); firstIndex=6, lastIndex=7
+	snapEnts := index(6).terms(6, 7)
+
+	tests := []struct {
+		name      string
+		snapIndex uint64 // 0 means no snapshot
+		ents      []*pb.Entry
+		prev      entryID
+		windex    uint64
+		wterm     uint64
+	}{
+		// --- fresh log: same prefix, entries extend the log (normal path) ---
+		{name: "same prefix extends", ents: freshEnts, prev: entryID{term: 3, index: 3}, windex: 0, wterm: 0},
+		{name: "same prefix extends more", ents: freshEnts, prev: entryID{term: 2, index: 2}, windex: 0, wterm: 0},
+		// --- fresh log: forked suffix, an entry conflicts ---
+		{name: "fork at 3", ents: freshEnts, prev: entryID{term: 3, index: 3}, windex: 3, wterm: 3}, // entries carry a different term at 3
+		{name: "fork at 2", ents: freshEnts, prev: entryID{term: 1, index: 1}, windex: 2, wterm: 2},
+		// --- fresh log: prev mismatch (term differs) ---
+		{name: "prev mismatch at 3", ents: freshEnts, prev: entryID{term: 2, index: 3}, windex: 3, wterm: 3},
+		{name: "prev mismatch at 2", ents: freshEnts, prev: entryID{term: 3, index: 2}, windex: 2, wterm: 2},
+		// --- fresh log: follower is behind (prev beyond lastIndex) ---
+		{name: "follower behind", ents: freshEnts, prev: entryID{term: 4, index: 4}, windex: 4, wterm: 0},
+		// --- snapshotted log: snapshot boundary matches ---
+		{name: "snapshot boundary matches", snapIndex: 5, ents: snapEnts, prev: entryID{term: 5, index: 5}, windex: 0, wterm: 0},
+		// --- snapshotted log: forked suffix at the first entry ---
+		{name: "snapshot fork at 6", snapIndex: 5, ents: snapEnts, prev: entryID{term: 5, index: 5}, windex: 6, wterm: 6},
+		// --- snapshotted log: prev mismatch at the snapshot boundary ---
+		{name: "snapshot boundary mismatch", snapIndex: 5, ents: snapEnts, prev: entryID{term: 6, index: 5}, windex: 5, wterm: 5},
+		// --- snapshotted log: compacted prefix (prev before the snapshot) ---
+		{name: "compacted prefix", snapIndex: 5, ents: snapEnts, prev: entryID{term: 4, index: 4}, windex: 5, wterm: 5},
+		{name: "compacted prefix far", snapIndex: 5, ents: snapEnts, prev: entryID{term: 0, index: 0}, windex: 5, wterm: 5},
+		// --- snapshotted log: follower is behind ---
+		{name: "snapshot follower behind", snapIndex: 5, ents: snapEnts, prev: entryID{term: 8, index: 8}, windex: 8, wterm: 0},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			st := NewMemoryStorage()
+			if tt.snapIndex != 0 {
+				require.NoError(t, st.ApplySnapshot(&pb.Snapshot{Metadata: &pb.SnapshotMetadata{
+					Index: new(tt.snapIndex),
+					Term:  new(tt.snapIndex),
+				}}))
+			}
+			l := newLog(st, raftLogger)
+			l.append(tt.ents...)
+
+			// Build a slice whose entries, when present, carry a conflicting term
+			// at the first conflicting index. For the "same prefix" cases the
+			// entries match the local log; for the "fork" cases they diverge.
+			var entries []*pb.Entry
+			switch tt.name {
+			case "same prefix extends":
+				entries = index(4).terms(4, 4)
+			case "same prefix extends more":
+				entries = index(3).terms(3, 4)
+			case "fork at 3":
+				entries = index(3).terms(4)
+			case "fork at 2":
+				entries = index(2).terms(4)
+			case "snapshot fork at 6":
+				entries = index(6).terms(8)
+			default:
+				entries = nil
+			}
+
+			idx, term := l.findConflictLoc(logSlice{prev: tt.prev, entries: entries})
+			require.Equal(t, tt.windex, idx, "conflict index")
+			require.Equal(t, tt.wterm, term, "conflict term")
+			// The returned index must never be out of the local log's known term
+			// range [firstIndex-1, lastIndex]. A zero index means no conflict.
+			if idx != 0 {
+				require.GreaterOrEqual(t, idx, l.firstIndex()-1, "conflict index below snapshot boundary")
+				require.LessOrEqual(t, idx, l.lastIndex()+1, "conflict index above lastIndex")
+			}
+		})
+	}
+}
+
 func TestIsUpToDate(t *testing.T) {
 	previousEnts := index(1).terms(1, 2, 3)
 	raftLog := newLog(NewMemoryStorage(), raftLogger)
@@ -310,7 +392,7 @@ func TestLogMaybeAppend(t *testing.T) {
 					require.True(t, tt.wpanic)
 				}
 			}()
-			glasti, gappend := raftLog.maybeAppend(app, tt.committed)
+			glasti, gappend, _, _ := raftLog.maybeAppend(app, tt.committed)
 			require.Equal(t, tt.wlasti, glasti)
 			require.Equal(t, tt.wappend, gappend)
 			require.Equal(t, tt.wcommit, raftLog.committed)
@@ -318,6 +400,97 @@ func TestLogMaybeAppend(t *testing.T) {
 				gents, err := raftLog.slice(raftLog.lastIndex()-uint64(len(tt.ents))+1, raftLog.lastIndex()+1, noLimit)
 				require.NoError(t, err)
 				require.Equal(t, tt.ents, gents)
+			}
+		})
+	}
+}
+
+// TestMaybeAppendConflictLoc verifies that maybeAppend reports the first
+// conflict index and the local term there when the entries cannot be appended,
+// and that the commit index is still updated according to the original append
+// semantics (committed = min(leaderCommit, lastnewi) on success, unchanged on
+// failure). It covers the normal path (same prefix), the abnormal path (forked
+// suffix), and the snapshot boundary (compacted prefix).
+func TestMaybeAppendConflictLoc(t *testing.T) {
+	freshEnts := index(1).terms(1, 2, 3)
+	snapEnts := index(6).terms(6, 7)
+
+	tests := []struct {
+		name      string
+		snapIndex uint64 // 0 means no snapshot
+		ents      []*pb.Entry
+		committed uint64 // initial committed index
+		commitArg uint64 // commit arg passed to maybeAppend
+		prev      entryID
+		entries   []*pb.Entry
+
+		wlasti    uint64
+		wok       bool
+		wconfIdx  uint64
+		wconfTerm uint64
+		wcommit   uint64
+	}{
+		// normal path: same prefix, entries extend the log -> success, no conflict
+		{
+			name: "same prefix", ents: freshEnts, committed: 1, commitArg: 5,
+			prev: entryID{term: 3, index: 3}, entries: index(4).terms(4, 5),
+			wlasti: 5, wok: true, wconfIdx: 0, wconfTerm: 0, wcommit: 5,
+		},
+		// abnormal path: forked suffix, prev term differs -> failure, conflict at 3
+		{
+			name: "forked suffix", ents: freshEnts, committed: 1, commitArg: 5,
+			prev: entryID{term: 2, index: 3}, entries: index(4).terms(4),
+			wlasti: 0, wok: false, wconfIdx: 3, wconfTerm: 3, wcommit: 1,
+		},
+		// snapshot boundary: prev at the snapshot index, matches -> success
+		{
+			name: "snapshot boundary matches", snapIndex: 5, ents: snapEnts, committed: 5, commitArg: 7,
+			prev: entryID{term: 5, index: 5}, entries: snapEnts,
+			wlasti: 7, wok: true, wconfIdx: 0, wconfTerm: 0, wcommit: 7,
+		},
+		// snapshot boundary: compacted prefix, prev before the snapshot -> failure,
+		// conflict clamped to the snapshot boundary (index 5, term 5)
+		{
+			name: "compacted prefix", snapIndex: 5, ents: snapEnts, committed: 5, commitArg: 7,
+			prev: entryID{term: 4, index: 4}, entries: index(5).terms(5, 6),
+			wlasti: 0, wok: false, wconfIdx: 5, wconfTerm: 5, wcommit: 5,
+		},
+		// snapshot boundary: prev mismatch at the snapshot index -> failure,
+		// conflict at the snapshot boundary (index 5, term 5)
+		{
+			name: "snapshot boundary mismatch", snapIndex: 5, ents: snapEnts, committed: 5, commitArg: 7,
+			prev: entryID{term: 6, index: 5}, entries: index(6).terms(6),
+			wlasti: 0, wok: false, wconfIdx: 5, wconfTerm: 5, wcommit: 5,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			st := NewMemoryStorage()
+			if tt.snapIndex != 0 {
+				require.NoError(t, st.ApplySnapshot(&pb.Snapshot{Metadata: &pb.SnapshotMetadata{
+					Index: new(tt.snapIndex),
+					Term:  new(tt.snapIndex),
+				}}))
+			}
+			l := newLog(st, raftLogger)
+			l.append(tt.ents...)
+			l.committed = tt.committed
+
+			app := logSlice{term: 100, prev: tt.prev, entries: tt.entries}
+			require.NoError(t, app.valid())
+
+			lasti, ok, confIdx, confTerm := l.maybeAppend(app, tt.commitArg)
+			require.Equal(t, tt.wlasti, lasti, "lastnewi")
+			require.Equal(t, tt.wok, ok, "ok")
+			require.Equal(t, tt.wconfIdx, confIdx, "conflict index")
+			require.Equal(t, tt.wconfTerm, confTerm, "conflict term")
+			require.Equal(t, tt.wcommit, l.committed, "committed index")
+			// The conflict index must never be out of the local log's known term
+			// range. A zero index means no conflict.
+			if confIdx != 0 {
+				require.GreaterOrEqual(t, confIdx, l.firstIndex()-1, "conflict index below snapshot boundary")
+				require.LessOrEqual(t, confIdx, l.lastIndex()+1, "conflict index above lastIndex")
 			}
 		})
 	}

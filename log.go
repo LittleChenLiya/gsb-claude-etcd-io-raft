@@ -106,9 +106,15 @@ func (l *raftLog) String() string {
 
 // maybeAppend returns (0, false) if the entries cannot be appended. Otherwise,
 // it returns (last index of new entries, true).
-func (l *raftLog) maybeAppend(a logSlice, committed uint64) (lastnewi uint64, ok bool) {
+//
+// When the entries cannot be appended, the last two return values locate the
+// first conflict: the index at which the given slice diverges from the local
+// log, and the local log's term at that index. The index is always within the
+// local log's known term range (see findConflictLoc). On success, both are zero.
+func (l *raftLog) maybeAppend(a logSlice, committed uint64) (lastnewi uint64, ok bool, conflictIndex, conflictTerm uint64) {
 	if !l.matchTerm(a.prev) {
-		return 0, false
+		conflictIndex, conflictTerm = l.findConflictLoc(a)
+		return 0, false, conflictIndex, conflictTerm
 	}
 	// TODO(pav-kv): propagate logSlice down the stack. It will be used all the
 	// way down in unstable, for safety checks, and for useful bookkeeping.
@@ -127,7 +133,7 @@ func (l *raftLog) maybeAppend(a logSlice, committed uint64) (lastnewi uint64, ok
 		l.append(a.entries[ci-offset:]...)
 	}
 	l.commitTo(min(committed, lastnewi))
-	return lastnewi, true
+	return lastnewi, true, 0, 0
 }
 
 func (l *raftLog) append(ents ...*pb.Entry) uint64 {
@@ -164,6 +170,51 @@ func (l *raftLog) findConflict(ents []*pb.Entry) uint64 {
 		}
 	}
 	return 0
+}
+
+// findConflictLoc locates the first index at which the given log slice conflicts
+// with the local log, and returns the local log's term at that index.
+//
+// The returned index is always within the local log's known term range
+// [firstIndex-1, lastIndex]. If the slice's prev predates the local log (the
+// prefix has been compacted), the index is clamped to the snapshot boundary
+// (firstIndex-1) so that it is never out of bounds. If the local log does not
+// reach the slice's prev index (the follower is behind), the index is set to
+// lastIndex+1 with a zero term, indicating an unknown term.
+//
+// A zero index means there is no conflict: the slice's prev matches the local
+// log and all entries either match it or extend it.
+func (l *raftLog) findConflictLoc(a logSlice) (index, term uint64) {
+	fi := l.firstIndex()
+	li := l.lastIndex()
+	// The local log retains the term of the entry at fi-1 (the snapshot boundary)
+	// for matching purposes, even though the entry itself may have been compacted.
+	lo, hi := fi-1, li
+
+	pi := a.prev.index
+	if pi >= lo && pi <= hi {
+		if t, err := l.term(pi); err == nil && t == a.prev.term {
+			// The slice's prev matches the local log. The first conflict, if any,
+			// is among the entries.
+			if ci := l.findConflict(a.entries); ci != 0 && ci <= hi {
+				t, _ := l.term(ci)
+				return ci, t
+			}
+			return 0, 0
+		}
+		// The slice's prev is within range but its term differs: a true conflict.
+		t, _ := l.term(pi)
+		return pi, t
+	}
+	if pi < lo {
+		// Compacted prefix: the slice's prev predates the local log. Clamp to the
+		// snapshot boundary so the returned index is never out of bounds.
+		t, _ := l.term(lo)
+		return lo, t
+	}
+	// pi > hi: the local log does not reach the slice's prev index. Report the
+	// first missing index with an unknown (zero) term.
+	return hi + 1, 0
 }
 
 // findConflictByTerm returns a best guess on where this log ends matching
