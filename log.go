@@ -106,15 +106,20 @@ func (l *raftLog) String() string {
 
 // maybeAppend returns (0, false) if the entries cannot be appended. Otherwise,
 // it returns (last index of new entries, true).
+//
+// On the rejection path (a mismatching previous entry), use
+// locateAppendConflict to obtain the location of the first conflicting log
+// position and the term stored at that index in this log.
 func (l *raftLog) maybeAppend(a logSlice, committed uint64) (lastnewi uint64, ok bool) {
-	if !l.matchTerm(a.prev) {
+	cp, rejected := l.locateAppendConflict(a)
+	if rejected {
 		return 0, false
 	}
 	// TODO(pav-kv): propagate logSlice down the stack. It will be used all the
 	// way down in unstable, for safety checks, and for useful bookkeeping.
 
 	lastnewi = a.prev.index + uint64(len(a.entries))
-	ci := l.findConflict(a.entries)
+	ci := cp.index
 	switch {
 	case ci == 0:
 	case ci <= l.committed:
@@ -141,6 +146,26 @@ func (l *raftLog) append(ents ...*pb.Entry) uint64 {
 	return l.lastIndex()
 }
 
+// conflictPoint describes the first position at which a proposed log slice
+// diverges from this log.
+type conflictPoint struct {
+	// index is the raft log index of the first conflicting entry.
+	//
+	// It is never below firstIndex()-1. If the actual mismatch is located in a
+	// compacted prefix (i.e. its index predates the latest snapshot), it is
+	// clamped to firstIndex()-1: the last position whose term this log still
+	// retains (the snapshot's last index). This keeps all returned indexes in
+	// the range addressable via term(), and prevents callers from building
+	// out-of-bounds slice ranges against a compacted prefix.
+	index uint64
+	// term is the term stored in THIS log at index. It is the local term of the
+	// conflicting position, useful as a reject hint when negotiating log
+	// conflicts. It is 0 when the local term is unknown:
+	//	- index is past this log's lastIndex() (the entry is new), or
+	//	- the term cannot be read for another out-of-bounds reason.
+	term uint64
+}
+
 // findConflict finds the index of the conflict.
 // It returns the first pair of conflicting entries between the existing
 // entries and the given entries, if there are any.
@@ -152,18 +177,84 @@ func (l *raftLog) append(ents ...*pb.Entry) uint64 {
 // a different term.
 // The index of the given entries MUST be continuously increasing.
 func (l *raftLog) findConflict(ents []*pb.Entry) uint64 {
-	for i := range ents {
-		if id := pbEntryID(ents[i]); !l.matchTerm(id) {
-			if id.index <= l.lastIndex() {
-				// TODO(pav-kv): can simply print %+v of the id. This will change the
-				// log format though.
-				l.logger.Infof("found conflict at index %d [existing term: %d, conflicting term: %d]",
-					id.index, l.zeroTermOnOutOfBounds(l.term(id.index)), id.term)
-			}
-			return id.index
-		}
+	cp, conflict := l.locateConflict(ents)
+	if !conflict {
+		return 0
 	}
-	return 0
+	return cp.index
+}
+
+// locateConflict is like findConflict, but in addition to the index of the
+// first conflicting entry it also returns the term stored at that index in
+// this log. See conflictPoint for the precise meaning of the returned fields,
+// including the clamping at the snapshot boundary.
+//
+// Returns (conflictPoint{}, false) if every entry in ents matches an entry in
+// this log at the same index and term; in that case there is neither a
+// divergence nor new entries.
+func (l *raftLog) locateConflict(ents []*pb.Entry) (conflictPoint, bool) {
+	for i := range ents {
+		id := pbEntryID(ents[i])
+		if l.matchTerm(id) {
+			continue
+		}
+		if id.index <= l.lastIndex() {
+			// TODO(pav-kv): can simply print %+v of the id. This will change the
+			// log format though.
+			l.logger.Infof("found conflict at index %d [existing term: %d, conflicting term: %d]",
+				id.index, l.zeroTermOnOutOfBounds(l.term(id.index)), id.term)
+		}
+		return l.conflictPointAt(id.index), true
+	}
+	return conflictPoint{}, false
+}
+
+// locateAppendConflict locates why the given log slice can or cannot be
+// appended to this log.
+//
+// If the slice's previous entry does not match this log, it returns (cp,
+// true): the append must be rejected, and cp is the first conflicting position
+// (the previous entry) with the term stored at that index in this log.
+//
+// If the previous entry matches, it returns (cp, false): the append can
+// proceed, and cp is the same conflict location that findConflict(a.entries)
+// would report. cp.index is 0 when the local log already contains all the
+// entries; otherwise it is the index from which the entries diverge or are new,
+// i.e. the point at which the append truncates and rewrites the local tail.
+//
+// As with findConflict, an entry conflict with an already committed position is
+// a fatal error and panics when the append itself is attempted via
+// maybeAppend. This function only locates the conflict and performs no log
+// mutation, so no panic is raised here.
+func (l *raftLog) locateAppendConflict(a logSlice) (conflictPoint, bool) {
+	if !l.matchTerm(a.prev) {
+		return l.conflictPointAt(a.prev.index), true
+	}
+	// The previous entry matches, so the append always proceeds. The entries
+	// may still contain a diverging or extending tail; locate its first index
+	// for the caller (e.g. maybeAppend uses it for truncation), but do not
+	// report the slice as rejected.
+	cp, _ := l.locateConflict(a.entries)
+	return cp, false
+}
+
+// conflictPointAt builds a conflictPoint for a mismatch at index, clamping the
+// index to the snapshot boundary (firstIndex()-1) when the mismatch is inside
+// the compacted prefix. The returned term is this log's term at the resulting
+// index, or 0 if it is unavailable.
+func (l *raftLog) conflictPointAt(index uint64) conflictPoint {
+	// Clamp an index in the compacted prefix to firstIndex()-1. This position
+	// is the last index whose term this log retains (the term of the snapshot's
+	// last entry), so term() stays in bounds and the returned index can never
+	// precede the log's addressable range. index 0 (the empty-log origin) is
+	// returned as-is.
+	if index > 0 && index+1 < l.firstIndex() {
+		index = l.firstIndex() - 1
+	}
+	return conflictPoint{
+		index: index,
+		term:  l.zeroTermOnOutOfBounds(l.term(index)),
+	}
 }
 
 // findConflictByTerm returns a best guess on where this log ends matching
