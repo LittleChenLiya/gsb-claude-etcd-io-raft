@@ -27,6 +27,9 @@ type Status struct {
 	BasicStatus
 	Config   tracker.Config
 	Progress map[uint64]tracker.Progress
+	// Ballot is a sorted snapshot of the candidate's current election ballot.
+	// It is empty (Term == 0) when no election is in progress.
+	Ballot tracker.BallotSummary
 }
 
 // BasicStatus contains basic information about the Raft peer. It does not allocate.
@@ -72,6 +75,7 @@ func getStatus(r *raft) Status {
 		s.Progress = getProgressCopy(r)
 	}
 	s.Config = r.trk.Config.Clone()
+	s.Ballot = r.trk.BallotSummary()
 	return s
 }
 

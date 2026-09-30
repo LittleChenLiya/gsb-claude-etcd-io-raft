@@ -119,7 +119,15 @@ type ProgressTracker struct {
 
 	Progress ProgressMap
 
+	// Votes records the ballots cast in the election tracked by ballotTerm.
+	// A value of true means the voter granted its vote, false means it
+	// rejected the candidate.
 	Votes map[uint64]bool
+
+	// ballotTerm is the election term the current Votes pertain to. It is
+	// used to prevent delayed responses from an old term from rewriting the
+	// current ballot. 0 means no election is in progress.
+	ballotTerm uint64
 
 	MaxInflight      int
 	MaxInflightBytes uint64
@@ -241,18 +249,100 @@ func (p *ProgressTracker) LearnerNodes() []uint64 {
 	return nodes
 }
 
-// ResetVotes prepares for a new round of vote counting via recordVote.
-func (p *ProgressTracker) ResetVotes() {
+// VoteState is the state of a single voter's ballot in a leader election.
+type VoteState byte
+
+const (
+	// VoteNotResponded means the voter has not responded in the election yet.
+	VoteNotResponded VoteState = iota
+	// VoteGranted means the voter granted its vote to the candidate.
+	VoteGranted
+	// VoteRejected means the voter rejected the candidate.
+	VoteRejected
+)
+
+// String returns a human-readable representation of the vote state.
+func (s VoteState) String() string {
+	switch s {
+	case VoteGranted:
+		return "granted"
+	case VoteRejected:
+		return "rejected"
+	default:
+		return "not-responded"
+	}
+}
+
+// BallotVote is a single voter's ballot in a candidate election.
+type BallotVote struct {
+	// ID is the voter's node ID.
+	ID uint64
+	// State is the voter's response in the election.
+	State VoteState
+}
+
+// BallotSummary is a point-in-time snapshot of the votes cast in a
+// candidate's current election. Voters are listed in stable node-ID order so
+// the summary is deterministic across repeated queries.
+type BallotSummary struct {
+	// Term is the election term the ballot pertains to. It is 0 when no
+	// election is in progress (e.g. the node is a follower or a settled
+	// leader).
+	Term uint64
+	// Votes is the ballot state of every voting member, sorted by node ID.
+	Votes []BallotVote
+}
+
+// ResetVotes prepares for a new round of vote counting via recordVote. It
+// clears all ballots and tags the round with the given term (the term the
+// candidacy is polling for), so entering a new term always starts from an
+// empty ballot.
+func (p *ProgressTracker) ResetVotes(term uint64) {
 	p.Votes = map[uint64]bool{}
+	p.ballotTerm = term
 }
 
 // RecordVote records that the node with the given id voted for this Raft
-// instance if v == true (and declined it otherwise).
-func (p *ProgressTracker) RecordVote(id uint64, v bool) {
+// instance if v == true (and declined it otherwise). msgTerm is the term
+// carried by the response. A response from a term older than the currently
+// tracked election is ignored, so a delayed message from a previous
+// candidacy cannot rewrite the current ballot. Responses carrying a term at
+// least as new as the candidacy's term are accepted: for pre-vote, grants
+// arrive one term ahead and rejections carry the responder's term, which may
+// be older than the polled term but never older than the candidacy's term.
+func (p *ProgressTracker) RecordVote(msgTerm, id uint64, v bool) {
+	if p.ballotTerm != 0 && msgTerm < p.ballotTerm {
+		// Stale response from an old term: leave the current ballot intact.
+		return
+	}
 	_, ok := p.Votes[id]
 	if !ok {
 		p.Votes[id] = v
 	}
+}
+
+// BallotSummary returns a sorted snapshot of the current election ballot.
+// The summary is empty when no election is in progress (the node is a
+// follower or a settled leader).
+func (p *ProgressTracker) BallotSummary() BallotSummary {
+	if len(p.Votes) == 0 {
+		return BallotSummary{}
+	}
+	s := BallotSummary{Term: p.ballotTerm}
+	ids := p.VoterNodes()
+	s.Votes = make([]BallotVote, 0, len(ids))
+	for _, id := range ids {
+		state := VoteNotResponded
+		if v, ok := p.Votes[id]; ok {
+			if v {
+				state = VoteGranted
+			} else {
+				state = VoteRejected
+			}
+		}
+		s.Votes = append(s.Votes, BallotVote{ID: id, State: state})
+	}
+	return s
 }
 
 // TallyVotes returns the number of granted and rejected Votes, and whether the

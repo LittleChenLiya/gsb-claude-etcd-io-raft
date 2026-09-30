@@ -791,7 +791,7 @@ func (r *raft) reset(term uint64) {
 
 	r.abortLeaderTransfer()
 
-	r.trk.ResetVotes()
+	r.trk.ResetVotes(term)
 	r.trk.Visit(func(id uint64, pr *tracker.Progress) {
 		*pr = tracker.Progress{
 			Match:     0,
@@ -923,7 +923,7 @@ func (r *raft) becomePreCandidate() {
 	// but doesn't change anything else. In particular it does not increase
 	// r.Term or change r.Vote.
 	r.step = stepCandidate
-	r.trk.ResetVotes()
+	r.trk.ResetVotes(r.Term)
 	r.tick = r.tickElection
 	r.lead = None
 	r.state = StatePreCandidate
@@ -1072,13 +1072,13 @@ func (r *raft) campaign(t CampaignType) {
 	}
 }
 
-func (r *raft) poll(id uint64, t pb.MessageType, v bool) (granted int, rejected int, result quorum.VoteResult) {
+func (r *raft) poll(term, id uint64, t pb.MessageType, v bool) (granted int, rejected int, result quorum.VoteResult) {
 	if v {
 		r.logger.Infof("%x received %s from %x at term %d", r.id, t, id, r.Term)
 	} else {
 		r.logger.Infof("%x received %s rejection from %x at term %d", r.id, t, id, r.Term)
 	}
-	r.trk.RecordVote(id, v)
+	r.trk.RecordVote(term, id, v)
 	return r.trk.TallyVotes()
 }
 
@@ -1694,7 +1694,7 @@ func stepCandidate(r *raft, m *pb.Message) error {
 		r.becomeFollower(m.GetTerm(), m.GetFrom()) // always m.Term == r.Term
 		r.handleSnapshot(m)
 	case myVoteRespType:
-		gr, rj, res := r.poll(m.GetFrom(), m.GetType(), !m.GetReject())
+		gr, rj, res := r.poll(m.GetTerm(), m.GetFrom(), m.GetType(), !m.GetReject())
 		r.logger.Infof("%x has received %d %s votes and %d vote rejections", r.id, gr, m.GetType(), rj)
 		switch res {
 		case quorum.VoteWon:
