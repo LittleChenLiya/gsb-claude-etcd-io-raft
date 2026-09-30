@@ -159,6 +159,16 @@ type Node interface {
 	// Users of the Node must call Advance after retrieving the state returned by Ready (unless
 	// async storage writes is enabled, in which case it should never be called).
 	//
+	// A batch-acknowledgment fence serializes Ready batches with sync storage
+	// writes: once a Ready has been returned, the persisted entries of that
+	// Ready are not returned again until the batch has been acknowledged via
+	// Advance. With async storage writes the fence is released when the batch
+	// changes hands, preserving the storage-response pipeline.
+	//
+	// The channel is closed when the Node is stopped, so goroutines blocked
+	// waiting on Ready exit on Stop (they observe the zero value of Ready,
+	// which must not be advanced or otherwise acted upon).
+	//
 	// NOTE: No committed entries from the next Ready may be applied until all committed entries
 	// and snapshots from the previous one have finished.
 	Ready() <-chan Ready
@@ -306,7 +316,24 @@ type node struct {
 	stop       chan struct{}
 	status     chan chan Status
 
+	// readyBarrier is the Ready batch-acknowledgment fence. It holds at most
+	// one token. With sync storage writes the run loop must hold the token to
+	// publish a Ready batch, and returns it only when the published batch has
+	// been acknowledged with Advance. This makes it impossible to republish
+	// the persisted entries of an earlier batch before that batch's fence has
+	// been cleared. With async storage writes there is no Advance, so the
+	// token is returned immediately when the batch changes hands and the
+	// existing storage-response pipeline is left unchanged.
+	readyBarrier chan struct{}
+
 	rn *RawNode
+}
+
+// newReadyBarrier returns a readyBarrier armed with its single token.
+func newReadyBarrier() chan struct{} {
+	b := make(chan struct{}, 1)
+	b <- struct{}{}
+	return b
 }
 
 func newNode(rn *RawNode) node {
@@ -320,21 +347,24 @@ func newNode(rn *RawNode) node {
 		// make tickc a buffered chan, so raft node can buffer some ticks when the node
 		// is busy processing raft messages. Raft node will resume process buffered
 		// ticks when it becomes idle.
-		tickc:  make(chan struct{}, 128),
-		done:   make(chan struct{}),
-		stop:   make(chan struct{}),
-		status: make(chan chan Status),
-		rn:     rn,
+		tickc: make(chan struct{}, 128),
+		done:  make(chan struct{}),
+		// Buffered so that Stop never blocks even if run() exits for another
+		// reason (e.g. during tests that drive run() directly).
+		stop:         make(chan struct{}, 1),
+		status:       make(chan chan Status),
+		readyBarrier: newReadyBarrier(),
+		rn:           rn,
 	}
 }
 
 func (n *node) Stop() {
 	select {
 	case n.stop <- struct{}{}:
-		// Not already stopped, so trigger it
-	case <-n.done:
-		// Node has already been stopped - no need to do anything
-		return
+		// Not already stopped, so trigger it. stop is buffered, so this does
+		// not depend on run() receiving the signal.
+	default:
+		// Node has already been stopped.
 	}
 	// Block until the stop has been acknowledged by run()
 	<-n.done
@@ -350,8 +380,29 @@ func (n *node) run() {
 
 	lead := None
 
+	// fenceOpen reports whether the Ready batch-acknowledgment fence is open,
+	// i.e. no published batch is awaiting acknowledgment. The single token in
+	// n.readyBarrier is taken here and returned when the batch is acknowledged.
+	fenceOpen := false
 	for {
-		if advancec == nil && n.rn.HasReady() {
+		// Ready batch-acknowledgment fence: arm and publish a new batch only
+		// while we hold the fence token. The token is taken from
+		// n.readyBarrier here. With sync storage writes it is returned once the
+		// published batch has been acknowledged with Advance; with async
+		// storage writes there is no Advance (storage append/apply responses
+		// take its place and are themselves serialized inside RawNode), so the
+		// token is returned right after the batch changes hands, preserving the
+		// existing pipelined behavior. While a sync batch is outstanding, its
+		// persisted entries are thus never republished to a consumer that has
+		// not acknowledged them yet.
+		if !fenceOpen {
+			select {
+			case <-n.readyBarrier:
+				fenceOpen = true
+			default:
+			}
+		}
+		if advancec == nil && fenceOpen && n.rn.HasReady() {
 			// Populate a Ready. Note that this Ready is not guaranteed to
 			// actually be handled. We will arm readyc, but there's no guarantee
 			// that we will actually send on it. It's possible that we will
@@ -438,15 +489,32 @@ func (n *node) run() {
 				advancec = n.advancec
 			} else {
 				rd = Ready{}
+				// No Advance with async storage writes; hand-off is the
+				// acknowledgment for the fence. Re-arm it immediately so the
+				// storage-response pipeline stays pipelined.
+				n.readyBarrier <- struct{}{}
 			}
+			// The batch has changed hands and is awaiting acknowledgment; the
+			// fence stays closed until then.
+			fenceOpen = false
 			readyc = nil
 		case <-advancec:
 			n.rn.Advance(rd)
 			rd = Ready{}
 			advancec = nil
+			// The previous batch has been acknowledged; clear the fence so
+			// that the next Ready batch can be published.
+			n.readyBarrier <- struct{}{}
 		case c := <-n.status:
 			c <- getStatus(r)
 		case <-n.stop:
+			// Close readyc so that every waiter blocked on Ready() wakes up
+			// and exits instead of blocking forever. An accepted-but-unadvanced
+			// batch is intentionally left untouched: acceptReady only advanced
+			// RawNode bookkeeping, the batch itself stays recoverable in stable
+			// storage and is republished to a fresh consumer after restart; it
+			// is not discarded here.
+			close(n.readyc)
 			close(n.done)
 			return
 		}

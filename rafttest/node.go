@@ -71,7 +71,11 @@ func (n *node) start() {
 			select {
 			case <-ticker:
 				n.Tick()
-			case rd := <-n.Ready():
+			case rd, ok := <-n.Ready():
+				if !ok {
+					// The Node was stopped; Ready is closed.
+					return
+				}
 				if !raft.IsEmptyHardState(rd.HardState) {
 					n.mu.Lock()
 					n.state = rd.HardState
